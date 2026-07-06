@@ -5,11 +5,17 @@
 ```bash
 cd starter_code/problem1_traffic
 pip install -r requirements.txt
-python main.py
 ```
 
 ## How to Run
 
+### Interactive Web App (recommended for demo)
+```bash
+streamlit run app.py
+```
+Opens at **http://localhost:8501** — adjust sliders and click **Run Simulation**.
+
+### CLI (headless / CI)
 | Command | What it does |
 |---|---|
 | `python main.py` | 2-hour morning-rush simulation (default) |
@@ -19,10 +25,7 @@ python main.py
 | `python main.py --weather 0.6` | Rainy day (lower demand) |
 | `python main.py --no-plots` | Headless / CI mode, prints metrics only |
 
-Output files (in current directory):
-- `results.png` — main comparison chart
-- `ml_performance.png` — prediction accuracy + feature importances
-- `signal_timings.png` — how green splits vary across 24 h
+CLI output files: `results.png`, `ml_performance.png`, `signal_timings.png`
 
 ---
 
