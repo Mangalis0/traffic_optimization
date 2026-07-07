@@ -83,7 +83,9 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
                 for d in ("N", "S", "E", "W"):
                     if sim.intersections[i].approaches[d].blocked:
                         pred[i][d] = 0.0
-            # Augment with routing inflows so optimizer sizes green for total demand
+            # Scale external rates first (mirrors the simulator), then augment
+            # with routing inflows — prevents double-counting at downstream approaches.
+            pred = sim.scale_external_rates(pred)
             pred = sim.augment_rates_with_routing(pred)
             sim.set_timings(optimize_network_moo(pred))
 
@@ -93,6 +95,7 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
             if use_opt:
                 pred = predictor.predict_rates(h, day_of_week, weather)
                 pred[0]["N"] = 0.0
+                pred = sim.scale_external_rates(pred)
                 pred = sim.augment_rates_with_routing(pred)
                 sim.set_timings(optimize_network_moo(pred))
 
@@ -599,6 +602,7 @@ with tab_live:
 
             if use_opt_anim and step % 300 == 0:
                 pred = predictor.predict_rates(h, day_of_week, weather)
+                pred = sim.scale_external_rates(pred)
                 pred = sim.augment_rates_with_routing(pred)
                 sim.set_timings(optimize_network_moo(pred))
 

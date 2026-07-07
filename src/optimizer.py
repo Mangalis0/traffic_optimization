@@ -179,33 +179,42 @@ def optimize_network_moo(
         fairness_penalty = float(np.var(inter_delays))  # 0 when all equal
         return mean_delay + w_fairness * fairness_penalty
 
-    # Stability lower bounds: each green must be large enough that the
-    # intersection isn't oversaturated given SATURATION_FLOW.
-    # Minimum stable cycle: C_min = L / (1 - Y), so minimum green per phase
-    # is g_lb = y * C_min.  This prevents the solver from picking cycles that
-    # are shorter than the capacity constraint allows.
-    Y_arr = np.minimum(q_ns / SATURATION_FLOW + q_ew / SATURATION_FLOW, 0.95)
-    C_min_arr = np.clip(TOTAL_LOST_TIME / (1.0 - Y_arr), MIN_CYCLE, MAX_CYCLE)
-    g_ns_lb = np.clip(q_ns / SATURATION_FLOW * C_min_arr, MIN_GREEN, MAX_GREEN)
-    g_ew_lb = np.clip(q_ew / SATURATION_FLOW * C_min_arr, MIN_GREEN, MAX_GREEN)
+    # Stability constraints: g/C >= y must hold at whatever cycle the solver
+    # picks (not just at C_min).  Rearranged to a linear form for SLSQP:
+    #   NS: g_ns*(1-y_ns) - g_ew*y_ns  >= y_ns*L   (≥ 0 for scipy 'ineq')
+    #   EW: g_ew*(1-y_ew) - g_ns*y_ew  >= y_ew*L
+    y_ns = np.minimum(q_ns / SATURATION_FLOW, 0.95)
+    y_ew = np.minimum(q_ew / SATURATION_FLOW, 0.95)
+    L = TOTAL_LOST_TIME
 
-    # Warm-start: Webster's solution per intersection
+    constraints = []
+    for k in range(n):
+        ynk, yek = float(y_ns[k]), float(y_ew[k])
+
+        def _ns(x, k=k, y=ynk, L=L):
+            return x[2*k] * (1 - y) - x[2*k+1] * y - y * L
+
+        def _ew(x, k=k, y=yek, L=L):
+            return x[2*k+1] * (1 - y) - x[2*k] * y - y * L
+
+        constraints.append({'type': 'ineq', 'fun': _ns})
+        constraints.append({'type': 'ineq', 'fun': _ew})
+
+    # Warm-start: Webster's solution per intersection (always feasible)
     x0 = np.empty(2 * n)
     for k in range(n):
         _, g_ns0, g_ew0 = _websters(q_ns[k], q_ew[k])
         x0[2 * k]     = g_ns0
         x0[2 * k + 1] = g_ew0
 
-    bounds = []
-    for k in range(n):
-        bounds.append((float(g_ns_lb[k]), MAX_GREEN))
-        bounds.append((float(g_ew_lb[k]), MAX_GREEN))
+    bounds = [(MIN_GREEN, MAX_GREEN)] * (2 * n)
 
     result = minimize(
         objective, x0,
-        method='L-BFGS-B',
+        method='SLSQP',
         bounds=bounds,
-        options={'maxiter': 200, 'ftol': 1e-9},
+        constraints=constraints,
+        options={'maxiter': 500, 'ftol': 1e-9},
     )
 
     x_opt = result.x

@@ -99,8 +99,10 @@ def run_simulation(
                 for d in ('N', 'S', 'E', 'W'):
                     if sim.intersections[inter_id].approaches[d].blocked:
                         predicted[inter_id][d] = 0.0
-            # Augment with estimated routing inflows so the optimizer sizes
-            # green phases for total demand, not just external arrivals.
+            # Scale external rates down first (mirrors what the simulator does),
+            # then add routing inflows — prevents double-counting at downstream
+            # approaches that already have reduced external arrivals.
+            predicted = sim.scale_external_rates(predicted)
             predicted = sim.augment_rates_with_routing(predicted)
             sim.set_timings(optimize_network_moo(predicted))
 
@@ -116,6 +118,7 @@ def run_simulation(
             if use_optimization:
                 predicted = predictor.predict_rates(current_hour % 24, day_of_week, weather)
                 predicted[0]['N'] = 0.0
+                predicted = sim.scale_external_rates(predicted)
                 predicted = sim.augment_rates_with_routing(predicted)
                 sim.set_timings(optimize_network_moo(predicted))
 
