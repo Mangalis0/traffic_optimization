@@ -13,7 +13,7 @@ import streamlit as st
 
 from src.data_generator import generate_training_data, arrival_rate_for_hour
 from src.ml_model import TrafficPredictor, FEATURE_COLS
-from src.optimizer import optimize_network, fixed_timing
+from src.optimizer import optimize_network_moo, fixed_timing
 from src.simulator import TrafficSimulator, DT
 from src.vehicle_tracker import (
     VehicleTracker, vehicle_xy, signal_xy,
@@ -58,7 +58,7 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
 
     if use_opt:
         rates = predictor.predict_rates(start_hour % 24, day_of_week, weather)
-        sim.set_timings(optimize_network(rates))
+        sim.set_timings(optimize_network_moo(rates))
     else:
         sim.set_timings(fixed_timing(30.0))
 
@@ -66,7 +66,7 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
         t = step * DT
         h = (start_hour + t / 3600.0) % 24
 
-        actual_rates = {
+        raw_rates = {
             i: {
                 d: (0.0 if sim.intersections[i].approaches[d].blocked
                     else arrival_rate_for_hour(h, day_of_week, d, i, weather))
@@ -74,6 +74,8 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
             }
             for i in range(4)
         }
+        # Scale external arrivals for approaches that also receive routing inflows
+        actual_rates = sim.scale_external_rates(raw_rates)
 
         if use_opt and step % update_every == 0:
             pred = predictor.predict_rates(h, day_of_week, weather)
@@ -81,7 +83,9 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
                 for d in ("N", "S", "E", "W"):
                     if sim.intersections[i].approaches[d].blocked:
                         pred[i][d] = 0.0
-            sim.set_timings(optimize_network(pred))
+            # Augment with routing inflows so optimizer sizes green for total demand
+            pred = sim.augment_rates_with_routing(pred)
+            sim.set_timings(optimize_network_moo(pred))
 
         if trigger_accident and not accident_triggered and t >= 3600.0:
             sim.trigger_event("accident", 0, "N", 600.0)
@@ -89,7 +93,8 @@ def run_sim_full(use_opt, start_hour, sim_hours, day_of_week,
             if use_opt:
                 pred = predictor.predict_rates(h, day_of_week, weather)
                 pred[0]["N"] = 0.0
-                sim.set_timings(optimize_network(pred))
+                pred = sim.augment_rates_with_routing(pred)
+                sim.set_timings(optimize_network_moo(pred))
 
         sim.step(actual_rates)
 
@@ -176,13 +181,59 @@ def fig_network_static(snapshot, title="Network State"):
     return fig
 
 
+_ANIM_OPPOSITE    = {'N': 'S', 'S': 'N', 'E': 'W', 'W': 'E'}
+_TRANSIT_COLOR    = "#BF8A30"   # amber — distinct from queued cars and signal lights
+_TRANSIT_MAX_SHOW = 6           # max individual vehicles drawn per batch before "+n"
+_TRANSIT_GAP      = 0.10        # progress-units between successive vehicles in a platoon
+
+
+def _inter_transit_xy(tv: dict):
+    """
+    Compute screen (x, y) for a vehicle in transit between two intersections.
+
+    Convention (matches vehicle_tracker lane offsets):
+      approach_dir is the approach direction at BOTH source and destination.
+      exit_dir = OPPOSITE[approach_dir] is the direction of travel.
+
+    The vehicle is placed in the correct lane (LANE_OFFSET[approach_dir])
+    and travels from source stop-line → destination stop-line as progress 0→1.
+    """
+    approach_dir = tv['approach_dir']
+    exit_dir = _ANIM_OPPOSITE[approach_dir]
+
+    src_pos = INTER_POS[tv['src_inter_id']]
+    dst_pos = INTER_POS[tv['dst_inter_id']]
+    ex, ey  = DIR_VEC[exit_dir]         # direction of travel
+    ax_, ay = DIR_VEC[approach_dir]     # direction from destination center to stop-line
+    lx, ly  = LANE_OFFSET[approach_dir]
+
+    # Departure: just past source stop-line on the exit side
+    x_dep = src_pos[0] + ex * STOP_LINE + lx
+    y_dep = src_pos[1] + ey * STOP_LINE + ly
+
+    # Arrival: at destination stop-line (approaching from the source side)
+    x_arr = dst_pos[0] + ax_ * STOP_LINE + lx
+    y_arr = dst_pos[1] + ay  * STOP_LINE + ly
+
+    p = tv['progress']
+    return x_dep + p * (x_arr - x_dep), y_dep + p * (y_arr - y_dep)
+
+
 def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
     """
     Animated 2x2 grid with individual vehicle rectangles and two-lane roads.
 
-    Uses the scaled INTER_POS from vehicle_tracker (intersections at 0,3 spacing)
-    so vehicles have enough road space to queue without overlapping.
-    SA traffic light sequence: Red -> Green -> Orange -> Red.
+    Layers (bottom → top):
+      0  Roads (asphalt)
+      1  Road centre-line dividers
+      2  Intersection boxes
+      3  Intersection labels
+      4  Signal lights
+      5  Inter-intersection transit vehicles (amber — en-route between intersections)
+      6  Queued vehicles (coloured by car type)
+      7  Within-intersection transit (fading as they clear the box)
+
+    SA traffic light sequence: Red → Green → Orange → Red.
     """
     fig, ax = plt.subplots(figsize=(7, 7))
     margin = 1.1
@@ -192,10 +243,12 @@ def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
     ax.axis("off")
     ax.set_facecolor("#1a1a2e")
     fig.patch.set_facecolor("#1a1a2e")
+    n_transit = len(sim.transit_vehicles)
     ax.set_title(
         f"Live Traffic  |  {int(hour):02d}:{int((hour % 1) * 60):02d}"
-        f"  |  t = {t_sec / 60:.1f} min",
-        fontsize=12, color="white", pad=8,
+        f"  |  t = {t_sec / 60:.1f} min"
+        + (f"  |  {n_transit} batch(es) in transit" if n_transit else ""),
+        fontsize=11, color="white", pad=8,
     )
 
     # ── Roads: asphalt + white centre-line divider ────────────────────────────
@@ -227,20 +280,19 @@ def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
             if ap.blocked:
                 sig_col = "#555"
             elif phase == "NS" and d in ("N", "S"):
-                sig_col = "#00ff88"   # green
+                sig_col = "#00ff88"
             elif phase == "EW" and d in ("E", "W"):
-                sig_col = "#00ff88"   # green
+                sig_col = "#00ff88"
             elif phase == "YELLOW_to_EW" and d in ("N", "S"):
-                sig_col = "#ffdd00"   # yellow: NS was green, now clearing
+                sig_col = "#ffdd00"
             elif phase == "YELLOW_to_NS" and d in ("E", "W"):
-                sig_col = "#ffdd00"   # yellow: EW was green, now clearing
+                sig_col = "#ffdd00"
             else:
-                sig_col = "#ff3333"   # red
+                sig_col = "#ff3333"
 
             ax.add_patch(plt.Circle((sx, sy), 0.10, color=sig_col, zorder=4,
                                      ec="#000", lw=0.5, alpha=0.95))
 
-            # Overflow "+N" label, offset into the correct lane
             if ap.queue > MAX_SHOW:
                 dx, dy = DIR_VEC[d]
                 lx_off, ly_off = LANE_OFFSET[d]
@@ -250,7 +302,35 @@ def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
                         ha="center", va="center", fontsize=7,
                         color="#ffaa00", fontweight="bold", zorder=9)
 
-    # ── Queued vehicles (rectangles) ──────────────────────────────────────────
+    # ── Inter-intersection transit vehicles (amber) ───────────────────────────
+    # Vehicles served at one intersection and traveling to the next.
+    # Each vehicle in a batch is drawn at its own progress position (platoon),
+    # staggered by _TRANSIT_GAP in progress-units.  Excess shows "+n".
+    for tv in sim.transit_vehicles:
+        count    = tv['count']
+        n_show   = min(count, _TRANSIT_MAX_SHOW)
+        n_hidden = count - n_show
+        is_vert  = tv['approach_dir'] in ('N', 'S')
+        w = CAR_W['N'] if is_vert else CAR_W['E']
+        h = CAR_H['N'] if is_vert else CAR_H['E']
+
+        for k in range(n_show):
+            prog_k = max(0.0, tv['progress'] - k * _TRANSIT_GAP)
+            vx, vy = _inter_transit_xy({**tv, 'progress': prog_k})
+            ax.add_patch(plt.Rectangle(
+                (vx - w / 2, vy - h / 2), w, h,
+                color=_TRANSIT_COLOR, zorder=5, ec="white", lw=0.5, alpha=0.88,
+            ))
+
+        if n_hidden > 0:
+            # Place the "+n" label just behind the last drawn vehicle
+            prog_lbl = max(0.0, tv['progress'] - n_show * _TRANSIT_GAP)
+            lx, ly   = _inter_transit_xy({**tv, 'progress': prog_lbl})
+            ax.text(lx, ly, f"+{n_hidden}",
+                    ha="center", va="center", fontsize=7,
+                    color="#ffaa00", fontweight="bold", zorder=10)
+
+    # ── Queued vehicles (coloured rectangles at approaches) ───────────────────
     for veh in tracker.queued():
         vx, vy = vehicle_xy(veh)
         d = veh.direction
@@ -260,7 +340,7 @@ def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
             color=veh.color, zorder=6, ec="#000", lw=0.4,
         ))
 
-    # ── Transit vehicles (fading rectangles passing through intersection) ─────
+    # ── Within-intersection transit (fading as they clear the box) ────────────
     for veh in tracker.transiting():
         vx, vy = vehicle_xy(veh)
         d = veh.direction
@@ -273,11 +353,12 @@ def fig_network_live(sim, tracker: VehicleTracker, hour: float, t_sec: float):
 
     # ── Legend ────────────────────────────────────────────────────────────────
     ax.legend(handles=[
-        mpatches.Patch(color="#00ff88", label="Green"),
-        mpatches.Patch(color="#ffdd00", label="Yellow"),
-        mpatches.Patch(color="#ff3333", label="Red"),
-        mpatches.Patch(color="#555",    label="Blocked"),
-    ], loc="lower right", fontsize=8, framealpha=0.6,
+        mpatches.Patch(color="#00ff88",      label="Signal: green"),
+        mpatches.Patch(color="#ffdd00",      label="Signal: yellow"),
+        mpatches.Patch(color="#ff3333",      label="Signal: red"),
+        mpatches.Patch(color="#555",         label="Signal: blocked"),
+        mpatches.Patch(color=_TRANSIT_COLOR, label="In transit (inter-intersection)"),
+    ], loc="lower right", fontsize=7.5, framealpha=0.6,
        facecolor="#222", edgecolor="#555", labelcolor="white")
 
     fig.tight_layout()
@@ -436,6 +517,13 @@ with tab_cmp:
         else:
             st.warning(f"Below target: {pct_wait:.1f}% (target >= 20%)")
 
+        st.info(
+            "**Optimizer objective (MOO):** minimise mean network delay "
+            "+ 0.3 × variance of per-intersection delay. "
+            "The fairness term prevents any single intersection from becoming "
+            "a disproportionate bottleneck while others are lightly loaded."
+        )
+
         st.pyplot(fig_comparison(base_log, opt_log))
         plt.close("all")
 
@@ -489,17 +577,17 @@ with tab_live:
 
         if use_opt_anim:
             rates = predictor.predict_rates(start_hour % 24, day_of_week, weather)
-            sim.set_timings(optimize_network(rates))
+            sim.set_timings(optimize_network_moo(rates))
         else:
             sim.set_timings(fixed_timing(30.0))
 
-        render_every = 60   # 1 frame per simulated minute
+        render_every = 5    # 1 frame per 5 simulated seconds — lets you watch cars cross between intersections
 
         for step in range(total_steps):
             t = step * DT
             h = (start_hour + t / 3600.0) % 24
 
-            actual_rates = {
+            raw_anim = {
                 i: {
                     d: (0.0 if sim.intersections[i].approaches[d].blocked
                         else arrival_rate_for_hour(h, day_of_week, d, i, weather))
@@ -507,10 +595,12 @@ with tab_live:
                 }
                 for i in range(4)
             }
+            actual_rates = sim.scale_external_rates(raw_anim)
 
             if use_opt_anim and step % 300 == 0:
                 pred = predictor.predict_rates(h, day_of_week, weather)
-                sim.set_timings(optimize_network(pred))
+                pred = sim.augment_rates_with_routing(pred)
+                sim.set_timings(optimize_network_moo(pred))
 
             # Short accident (5 min) if enabled
             if trigger_accident and not acc_triggered and t >= 300:
@@ -526,13 +616,15 @@ with tab_live:
                 frame_slot.pyplot(f, use_container_width=True)
                 plt.close(f)
 
-                n_queued   = len(tracker.queued())
-                n_transit  = len(tracker.transiting())
+                n_queued      = len(tracker.queued())
+                n_transit     = len(tracker.transiting())
+                n_inter_trans = sum(tv['count'] for tv in sim.transit_vehicles)
                 metrics_slot.info(
                     f"t = {t / 60:.1f} min  |  "
                     f"Avg wait = **{sim.avg_wait_time:.1f} s**  |  "
-                    f"Served = **{sim.throughput():,}**  |  "
-                    f"Visible cars = **{n_queued + n_transit}**"
+                    f"Exited network = **{sim.throughput():,}**  |  "
+                    f"Queued = **{n_queued}**  |  "
+                    f"In transit = **{n_inter_trans}**"
                 )
                 time.sleep(frame_sleep)
 
@@ -555,7 +647,7 @@ with tab_timing:
     )
 
     timings_history = [
-        {"hour": h, "timings": optimize_network(
+        {"hour": h, "timings": optimize_network_moo(
             predictor.predict_rates(h, day_of_week, weather)
         )}
         for h in range(24)
@@ -574,7 +666,7 @@ with tab_timing:
     st.markdown("#### Per-hour deep-dive")
     sel_hour = st.slider("Hour to inspect", 0, 23, start_hour, key="timing_hour")
     rates_h  = predictor.predict_rates(sel_hour, day_of_week, weather)
-    timings_h = optimize_network(rates_h)
+    timings_h = optimize_network_moo(rates_h)
 
     cols = st.columns(4)
     for i, col in enumerate(cols):
@@ -594,10 +686,18 @@ with tab_ml_tab:
     st.subheader("ML Traffic Prediction Model")
     st.markdown(
         f"**Model:** GradientBoosting Regressor (200 trees, depth 5)  |  "
-        f"**Training samples:** {ml_metrics['train_samples']:,}  |  "
-        f"**5-fold CV RMSE:** {ml_metrics['cv_rmse_mean']:.1f} "
-        f"+/- {ml_metrics['cv_rmse_std']:.1f} veh/hr"
+        f"**Training samples:** {ml_metrics['train_samples']:,}"
     )
+
+    vm1, vm2, vm3 = st.columns(3)
+    vm1.metric("5-fold CV RMSE (train split)",
+               f"{ml_metrics['cv_rmse_mean']:.1f} ± {ml_metrics['cv_rmse_std']:.1f} veh/hr",
+               help="Cross-validation on the first 80% of days (training portion only).")
+    vm2.metric("Hold-out RMSE (last 20% of days)",
+               f"{ml_metrics['test_rmse']:.1f} veh/hr",
+               help="Evaluated on days 24-29 — data the model never saw during training.")
+    vm3.metric("Demand range", "80 – 980 veh/hr",
+               help="Context for interpreting RMSE: error is small relative to the range.")
 
     sample = training_df.sample(min(8000, len(training_df)), random_state=42)
     st.pyplot(fig_ml(sample))
@@ -609,6 +709,6 @@ with tab_ml_tab:
 - `cos_hour` / `sin_hour` dominate — time of day is the primary traffic driver.
 - `direction_encoded` contributes notably — N-S vs E-W flows shift during rush hours.
 - `weather` has a modest but measurable effect (up to -15% demand in heavy rain).
-- Low CV RMSE relative to the 80-980 veh/hr demand range shows a well-fitted model.
+- CV RMSE ≈ hold-out RMSE confirms the model generalises and is not overfit.
         """
     )

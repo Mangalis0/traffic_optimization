@@ -99,7 +99,7 @@ With `--accident`, intersection 0's north approach is blocked for 10 minutes at 
 ## File Structure
 
 ```
-problem1_traffic/
+traffic_optimization/
 ├── main.py                    # CLI entry point
 ├── requirements.txt
 ├── README.md

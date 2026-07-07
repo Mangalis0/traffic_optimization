@@ -8,6 +8,7 @@ Why GBR?
 - Handles non-linear rush-hour peaks naturally
 - Fast to train on synthetic data (< 5 s for 30 days)
 - Good out-of-box performance without extensive tuning
+- Feature importances are directly interpretable
 """
 
 import numpy as np
@@ -53,16 +54,35 @@ class TrafficPredictor:
 
     def train(self, df: pd.DataFrame) -> Dict:
         """
-        Fit on historical data and return cross-validation metrics.
+        Fit on historical data and return validation metrics.
+
+        Validation strategy:
+        - Data is split 80/20 chronologically (later days = hold-out).
+          This mimics real deployment: train on past, evaluate on future.
+        - 5-fold CV is run on the training portion only (honest estimate
+          of generalisation without contaminating the hold-out).
+        - Final model is refit on the full dataset for best predictions.
         """
         X = df[FEATURE_COLS].values
         y = df[TARGET_COL].values
 
+        # Chronological split: first 80% of rows = training days
+        split = int(0.8 * len(df))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+
+        # Cross-validation on training portion only
         cv_scores = cross_val_score(
-            self.model, X, y, cv=5, scoring='neg_mean_squared_error'
+            self.model, X_train, y_train, cv=5, scoring='neg_mean_squared_error'
         )
         cv_rmse = np.sqrt(-cv_scores)
 
+        # Fit on training split, evaluate on hold-out
+        self.model.fit(X_train, y_train)
+        test_preds = self.model.predict(X_test)
+        test_rmse = float(np.sqrt(np.mean((test_preds - y_test) ** 2)))
+
+        # Refit on full data for deployment (best predictions going forward)
         self.model.fit(X, y)
         self.trained = True
 
@@ -70,6 +90,7 @@ class TrafficPredictor:
         return {
             'cv_rmse_mean': float(cv_rmse.mean()),
             'cv_rmse_std': float(cv_rmse.std()),
+            'test_rmse': test_rmse,
             'feature_importances': dict(zip(FEATURE_COLS, importances.tolist())),
             'train_samples': len(df),
         }
@@ -79,17 +100,19 @@ class TrafficPredictor:
         hour: float,
         day_of_week: int,
         weather: float,
+        num_intersections: int = 4,
     ) -> Dict[int, Dict[str, float]]:
         """
-        Predict arrival rates for all 16 approach lanes (4 intersections × 4 directions).
+        Predict arrival rates for all approach lanes.
 
         Returns:
             {intersection_id: {direction: rate_vph}}
         """
-        assert self.trained, "Call train() first."
+        if not self.trained:
+            raise RuntimeError("Call train() before predict_rates().")
 
         rows = []
-        for inter_id in range(4):
+        for inter_id in range(num_intersections):
             for direction, dir_enc in _DIR_ENC.items():
                 rows.append({
                     'sin_hour': np.sin(2 * np.pi * hour / 24),
@@ -108,7 +131,7 @@ class TrafficPredictor:
 
         result: Dict[int, Dict[str, float]] = {}
         idx = 0
-        for inter_id in range(4):
+        for inter_id in range(num_intersections):
             result[inter_id] = {}
             for direction in _DIRECTIONS:
                 result[inter_id][direction] = float(preds[idx])

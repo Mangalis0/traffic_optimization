@@ -12,10 +12,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict
 
-
 DIRECTIONS = ['N', 'S', 'E', 'W']
 DIRECTION_ENC = {'N': 0, 'S': 1, 'E': 2, 'W': 3}
-NUM_INTERSECTIONS = 4
 
 
 def arrival_rate_for_hour(
@@ -32,7 +30,7 @@ def arrival_rate_for_hour(
         hour: hour of day (0-23, may be fractional)
         day_of_week: 0=Monday … 6=Sunday
         direction: 'N' / 'S' / 'E' / 'W'
-        intersection_id: 0-3
+        intersection_id: integer index
         weather: 1.0 = clear, 0.5 = heavy rain
 
     Returns:
@@ -69,22 +67,12 @@ def arrival_rate_for_hour(
     evening_rush = (not is_weekend) and (17 <= hour < 19)
 
     if direction in ('N', 'S'):
-        if morning_rush:
-            dir_mult = 1.4
-        elif evening_rush:
-            dir_mult = 0.7
-        else:
-            dir_mult = 1.0
+        dir_mult = 1.4 if morning_rush else (0.7 if evening_rush else 1.0)
     else:  # E / W
-        if morning_rush:
-            dir_mult = 0.7
-        elif evening_rush:
-            dir_mult = 1.4
-        else:
-            dir_mult = 1.0
+        dir_mult = 0.7 if morning_rush else (1.4 if evening_rush else 1.0)
 
-    # --- Per-intersection variation ---
-    inter_mult = [1.0, 0.9, 1.1, 0.95][intersection_id]
+    # --- Per-intersection variation (±10%, cycles with period 4) ---
+    inter_mult = 1.0 + 0.1 * np.sin(np.pi * intersection_id / 2)
 
     # --- Weather: rain reduces demand up to 15% ---
     weather_mult = 0.85 + 0.15 * weather
@@ -92,12 +80,21 @@ def arrival_rate_for_hour(
     return max(20.0, base * dir_mult * inter_mult * weather_mult)
 
 
-def generate_training_data(days: int = 30, seed: int = 42) -> pd.DataFrame:
+def generate_training_data(
+    days: int = 30,
+    num_intersections: int = 4,
+    seed: int = 42,
+) -> pd.DataFrame:
     """
     Generate a labelled dataset of historical traffic records.
 
-    Each row represents one (15-minute interval, intersection, direction) observation.
-    Returns a DataFrame ready for ML training.
+    Each row represents one (15-minute interval, intersection, direction)
+    observation. Returns a DataFrame ready for ML training.
+
+    Args:
+        days: number of days to simulate
+        num_intersections: how many intersections to generate data for
+        seed: random seed for reproducibility
     """
     np.random.seed(seed)
     records = []
@@ -110,7 +107,7 @@ def generate_training_data(days: int = 30, seed: int = 42) -> pd.DataFrame:
             for minute in (0, 15, 30, 45):
                 t = hour + minute / 60.0
 
-                for inter_id in range(NUM_INTERSECTIONS):
+                for inter_id in range(num_intersections):
                     for direction in DIRECTIONS:
                         rate = arrival_rate_for_hour(t, dow, direction, inter_id, weather)
                         rate += float(np.random.normal(0, rate * 0.08))
